@@ -1,34 +1,26 @@
 {
-  "name": "claude-docs",
-  "version": "1.0.0",
-  "description": "A global MCP server that gives Claude a persistent, per-project knowledge base",
-  "type": "module",
-  "bin": {
-    "claude-docs": "dist/index.js"
-  },
+  "name": "@colbymchenry/claude-docs",
+  "version": "2.0.0",
+  "description": "MCP server giving Claude a persistent, per-project knowledge base with semantic search",
   "scripts": {
-    "build": "tsc",
-    "postinstall": "node scripts/postinstall.mjs",
-    "prepublishOnly": "npm run build"
+    "postinstall": "node scripts/postinstall.mjs"
   },
   "files": [
-    "dist",
-    "scripts"
+    "server.py",
+    "query.py",
+    "pyproject.toml",
+    "uv.lock",
+    "install.sh",
+    "uninstall.sh",
+    "scripts",
+    "hooks"
   ],
   "keywords": [
     "claude",
     "mcp",
     "documentation",
-    "knowledge-base"
+    "knowledge-base",
+    "semantic-search"
   ],
-  "license": "MIT",
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.0",
-    "@vscode/ripgrep": "^1.15.0",
-    "zod": "^3.23.0"
-  },
-  "devDependencies": {
-    "@types/node": "^20.0.0",
-    "typescript": "^5.5.0"
-  }
+  "license": "MIT"
 }

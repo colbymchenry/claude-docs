@@ -1,5 +1,16 @@
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+
 node_modules/
 dist/
 *.tgz
 
 .DS_Store
+
+*.bin
+
+*.sqlite3
+
+*.lock

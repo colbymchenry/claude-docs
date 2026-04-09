@@ -111,7 +111,7 @@ fi
 touch "$MARKER"
 
 cat >&2 <<'MSG'
-Call list_docs() then save_doc() for anything you learned this session: how things work, error fixes, correct config/types, conventions, or workflow instructions from the user. Be specific.
+You MUST now call list_docs() and review what you learned this session. Then call save_doc() for anything worth preserving. This is NOT optional. If you made code changes, you almost certainly have something to document.
 MSG
 exit 2
 ```

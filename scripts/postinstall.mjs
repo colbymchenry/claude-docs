@@ -4,18 +4,25 @@
  * claude-docs postinstall script
  *
  * Automatically configures Claude Code with:
- * 1. MCP server registration (via `claude mcp add -s user`)
- * 2. Tool auto-allow permissions
- * 3. Stop hook that nudges Claude to document findings each session
+ * 1. Python dependencies via uv
+ * 2. MCP server registration
+ * 3. Tool auto-allow permissions
+ * 4. Stop hook that nudges Claude to document findings each session
+ * 5. Bootstrap embedding index for existing docs
  */
 
 import { readFileSync, writeFileSync, mkdirSync, chmodSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { homedir } from "node:os";
-import { execFileSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const PKG_DIR = dirname(__dirname); // package root (one level up from scripts/)
 
 const CLAUDE_DIR = join(homedir(), ".claude");
-const SETTINGS_PATH = join(CLAUDE_DIR, "settings.json");
+const MCP_PATH = join(homedir(), ".claude.json"); // MCP server configs
+const SETTINGS_PATH = join(CLAUDE_DIR, "settings.json"); // hooks, permissions
 const HOOKS_DIR = join(CLAUDE_DIR, "hooks");
 const HOOK_PATH = join(HOOKS_DIR, "claude-docs-stop.sh");
 
@@ -25,6 +32,7 @@ const PERMISSIONS = [
   "mcp__claude-docs__save_doc",
   "mcp__claude-docs__search_docs",
   "mcp__claude-docs__delete_doc",
+  "mcp__claude-docs__semantic_search_docs",
 ];
 
 const HOOK_SCRIPT = `#!/bin/bash
@@ -41,65 +49,101 @@ fi
 touch "$MARKER"
 
 cat >&2 <<'EOF'
-Before finishing, call list_docs() and check: should you document anything from this session?
+You MUST now call list_docs() and review what you learned this session. Then call save_doc() for anything worth preserving. This is NOT optional.
 
-Document if you:
-- Looked up how something works (APIs, config formats, setting types, schema details)
-- Hit an error and found the fix (wrong field names, type mismatches, correct invocations)
-- Discovered non-obvious conventions (string vs int types, naming patterns, required flags)
-- Learned how subsystems connect (data flow, dependencies, integration points)
-- Received workflow instructions from the user (linting commands, validation steps, deploy procedures, review checklists)
+What to document — if you did ANY of these, save a doc:
+- Read code to understand how something works
+- Hit an error and found the fix
+- Discovered config formats, correct types, or non-obvious conventions
+- Learned how subsystems connect or data flows
+- Received workflow instructions from the user ("always run X", "never do Y")
 
-IMPORTANT: User workflow instructions like "always run X before Y" are PROJECT conventions — save them with save_doc(), not personal memory. They belong in .claude/docs/ so all sessions and team members benefit.
+What NOT to skip:
+- "Derivable from code" is NOT a reason to skip — the whole point is saving future sessions from re-deriving it
+- User workflow instructions are PROJECT conventions — save to .claude/docs/, not personal memory
+- If you read or referenced any docs this session that are now stale due to your changes, UPDATE them
 
-"Derivable from the codebase" is NOT a reason to skip — the whole point is saving future sessions from re-deriving it. If you had to read code to figure it out, document it.
+Procedure:
+1. Call list_docs() to see existing docs
+2. Call semantic_search_docs() with your topic to find related docs
+3. UPDATE existing docs rather than creating duplicates
+4. Be specific: include actual config values, correct types, file paths, function names, working examples
 
-Also check if any docs you read, referenced, or saved earlier in this session need updating based on subsequent changes.
-
-Use save_doc() to create or update docs. Be specific: include actual setting names, correct types, file paths, and working examples.
+If you made code changes this session, you almost certainly have something to document. Do it now.
 EOF
 exit 2
 `;
 
-function readSettings() {
-  if (!existsSync(SETTINGS_PATH)) return {};
+function readJson(path) {
+  if (!existsSync(path)) return {};
   try {
-    return JSON.parse(readFileSync(SETTINGS_PATH, "utf-8"));
+    return JSON.parse(readFileSync(path, "utf-8"));
   } catch {
     return {};
   }
 }
 
+function writeJson(path, data) {
+  writeFileSync(path, JSON.stringify(data, null, 2) + "\n");
+}
+
+function readSettings() {
+  return readJson(SETTINGS_PATH);
+}
+
 function writeSettings(settings) {
-  writeFileSync(SETTINGS_PATH, JSON.stringify(settings, null, 2) + "\n");
+  writeJson(SETTINGS_PATH, settings);
+}
+
+function commandExists(cmd) {
+  try {
+    execSync(`command -v ${cmd}`, { stdio: "pipe" });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function main() {
+  // Check for uv
+  if (!commandExists("uv")) {
+    console.log("claude-docs: uv is required but not found.");
+    console.log("  Install with: curl -LsSf https://astral.sh/uv/install.sh | sh");
+    console.log("  Then re-run: npm install -g @colbymchenry/claude-docs");
+    return;
+  }
+
   // Check if ~/.claude exists (Claude Code installed)
   if (!existsSync(CLAUDE_DIR)) {
     console.log("claude-docs: ~/.claude not found — install Claude Code first, then re-run: npm install -g @colbymchenry/claude-docs");
     return;
   }
 
+  // 1. Install Python dependencies
+  console.log("claude-docs: installing Python dependencies...");
+  try {
+    execFileSync("uv", ["sync"], { cwd: PKG_DIR, stdio: "pipe" });
+    console.log("claude-docs: Python dependencies installed");
+  } catch (err) {
+    console.log("claude-docs: failed to install Python deps — run manually: cd " + PKG_DIR + " && uv sync");
+    console.log(err.stderr?.toString() || err.message);
+    return;
+  }
+
+  // 2. Register MCP server in ~/.claude.json
+  const mcpConfig = readJson(MCP_PATH);
+  if (!mcpConfig.mcpServers) mcpConfig.mcpServers = {};
+  mcpConfig.mcpServers["claude-docs"] = {
+    command: "uv",
+    args: ["run", "--directory", PKG_DIR, "python", "server.py"],
+  };
+  writeJson(MCP_PATH, mcpConfig);
+  console.log("claude-docs: registered MCP server in ~/.claude.json");
+
   const settings = readSettings();
   let changed = false;
 
-  // 1. Register MCP server via `claude mcp add -s user`
-  try {
-    execFileSync("claude", ["mcp", "add", "-s", "user", "claude-docs", "claude-docs"], {
-      stdio: "pipe",
-    });
-    console.log("claude-docs: registered MCP server");
-  } catch (err) {
-    // Already registered or claude CLI not found
-    if (err.stderr?.toString().includes("already exists")) {
-      console.log("claude-docs: MCP server already registered");
-    } else {
-      console.log("claude-docs: could not register MCP server via CLI — run manually: claude mcp add -s user claude-docs claude-docs");
-    }
-  }
-
-  // 2. Add permissions
+  // 3. Add permissions
   if (!settings.permissions) settings.permissions = {};
   if (!settings.permissions.allow) settings.permissions.allow = [];
   const missing = PERMISSIONS.filter((p) => !settings.permissions.allow.includes(p));
@@ -109,13 +153,37 @@ function main() {
     console.log("claude-docs: added tool permissions");
   }
 
-  // 3. Install stop hook script
+  // 4. Register UserPromptSubmit hook (auto doc recall)
+  if (!settings.hooks) settings.hooks = {};
+  if (!settings.hooks.UserPromptSubmit) settings.hooks.UserPromptSubmit = [];
+
+  const promptHookPath = join(PKG_DIR, "hooks", "claude-docs-on-prompt.sh");
+  const promptHookExists = settings.hooks.UserPromptSubmit.some((entry) =>
+    entry.hooks?.some((h) => h.command?.includes("claude-docs-on-prompt.sh"))
+  );
+
+  if (!promptHookExists) {
+    settings.hooks.UserPromptSubmit.push({
+      matcher: ".*",
+      hooks: [
+        {
+          type: "command",
+          command: promptHookPath,
+          timeout: 10,
+        },
+      ],
+    });
+    changed = true;
+    console.log("claude-docs: registered prompt hook (auto doc recall)");
+  }
+
+  // 5. Install stop hook script
   mkdirSync(HOOKS_DIR, { recursive: true });
   writeFileSync(HOOK_PATH, HOOK_SCRIPT);
   chmodSync(HOOK_PATH, 0o755);
   console.log("claude-docs: installed stop hook");
 
-  // 4. Register stop hook in settings
+  // 5. Register stop hook in settings
   if (!settings.hooks) settings.hooks = {};
   if (!settings.hooks.Stop) settings.hooks.Stop = [];
 
@@ -143,7 +211,18 @@ function main() {
     writeSettings(settings);
   }
 
-  console.log("claude-docs: setup complete");
+  // 6. Bootstrap embedding index for existing docs (in cwd if it's a project)
+  try {
+    execFileSync("uv", ["run", "--directory", PKG_DIR, "python", "server.py", "--index", process.cwd()], {
+      cwd: PKG_DIR,
+      stdio: "pipe",
+    });
+    console.log("claude-docs: bootstrapped embedding index");
+  } catch {
+    // No docs to index yet, or first install — not a problem
+  }
+
+  console.log("claude-docs: setup complete — restart Claude Code for changes to take effect");
 }
 
 main();
