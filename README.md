@@ -8,26 +8,36 @@ Think of it as giving Claude its own wiki per project — except it's just markd
 
 Claude Code is stateless between sessions. Every new conversation starts from scratch — Claude re-reads source files, re-discovers patterns, and re-learns conventions it already figured out last time. This wastes time and tokens.
 
-claude-docs fixes this by giving Claude 5 tools to maintain a project knowledge base:
+claude-docs fixes this by giving Claude 6 tools to maintain a project knowledge base:
 
 - **`list_docs()`** — See what's documented. Called at the start of every task.
 - **`lookup_doc(topic)`** — Read a doc. Fuzzy matches topic names, warns if docs are stale (60+ days old), notes `[[wiki-links]]` to related docs.
 - **`save_doc(topic, content)`** — Write a doc. Auto-sets timestamps, returns previous content if overwriting.
-- **`search_docs(query)`** — Grep across all docs. Powered by ripgrep (bundled via `@vscode/ripgrep`).
+- **`search_docs(query)`** — Regex search across all docs.
+- **`semantic_search_docs(query)`** — Search by meaning using ChromaDB vector embeddings. Finds conceptually related content even without keyword matches.
 - **`delete_doc(topic)`** — Remove a doc. Cleans up empty directories.
 
 ## Install
 
+Requires [uv](https://docs.astral.sh/uv/) and [jq](https://jqlang.github.io/jq/).
+
 ```bash
-npm install -g claude-docs
-claude mcp add -s user claude-docs claude-docs
+git clone https://github.com/colbymchenry/claude-docs.git
+cd claude-docs
+./install.sh
 ```
 
-That's it. Every project you open with Claude Code now has the tools available.
+This installs Python dependencies, registers the MCP server in `~/.claude.json`, adds tool permissions, and sets up Stop + UserPromptSubmit hooks. Restart Claude Code after installing.
 
-### Auto-allow the tools (recommended)
+Alternatively, install via npm (runs the same setup automatically via postinstall):
 
-Add these to your `~/.claude/settings.json` permissions so Claude doesn't prompt for each tool call:
+```bash
+npm install -g @colbymchenry/claude-docs
+```
+
+### Auto-allowed tools
+
+The installer adds these permissions to `~/.claude/settings.json`:
 
 ```json
 {
@@ -37,7 +47,8 @@ Add these to your `~/.claude/settings.json` permissions so Claude doesn't prompt
       "mcp__claude-docs__lookup_doc",
       "mcp__claude-docs__save_doc",
       "mcp__claude-docs__search_docs",
-      "mcp__claude-docs__delete_doc"
+      "mcp__claude-docs__delete_doc",
+      "mcp__claude-docs__semantic_search_docs"
     ]
   }
 }
@@ -47,7 +58,7 @@ Add these to your `~/.claude/settings.json` permissions so Claude doesn't prompt
 
 ### Storage
 
-Docs live in `.claude/docs/` at your project root. Commit them to git so the whole team benefits.
+Docs live in `.claude/docs/` at your project root. Embeddings are stored in `.claude/docs/.embeddings/`. Commit the docs to git so the whole team benefits (embeddings are regenerated automatically).
 
 ```
 .claude/docs/
@@ -59,7 +70,10 @@ Docs live in `.claude/docs/` at your project root. Commit them to git so the who
     typescript-validation.md
   api/
     routes.md
+  .embeddings/     # ChromaDB vector store (auto-generated, gitignore this)
 ```
+
+A file watcher monitors `.claude/docs/` and auto-indexes any changes — docs created via `save_doc()`, `Edit`, `Write`, or even your text editor are all picked up.
 
 ### Doc format
 
@@ -93,11 +107,19 @@ When a doc hasn't been updated in over 60 days, `lookup_doc()` includes a warnin
 
 > ⚠ This doc was last updated 93 days ago — verify against source code before relying on it.
 
-## Stop Hook (Optional)
+## Hooks (installed automatically)
 
-The real power comes from pairing claude-docs with a Stop hook that nudges Claude to document findings at the end of every session.
+The installer configures two hooks:
 
-Create `~/.claude/hooks/claude-docs-stop.sh`:
+### UserPromptSubmit — auto doc recall
+
+On every prompt, `hooks/claude-docs-on-prompt.sh` queries your doc embeddings for context relevant to what you just asked. Matching doc chunks are injected as `additionalContext` so Claude has project knowledge before responding — no manual `lookup_doc()` needed.
+
+### Stop — document findings
+
+Once per session, Claude is prompted to call `list_docs()` and `save_doc()` for anything it learned.
+
+The hook script (`~/.claude/hooks/claude-docs-stop.sh`):
 
 ```bash
 #!/bin/bash
@@ -116,11 +138,9 @@ MSG
 exit 2
 ```
 
-```bash
-chmod +x ~/.claude/hooks/claude-docs-stop.sh
-```
+### Manual hook setup
 
-Register it in `~/.claude/settings.json`:
+If you didn't use the installer, create the stop hook script above, then register both hooks in `~/.claude/settings.json`:
 
 ```json
 {
@@ -136,25 +156,34 @@ Register it in `~/.claude/settings.json`:
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": ".*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/claude-docs/hooks/claude-docs-on-prompt.sh",
+            "timeout": 10
+          }
+        ]
+      }
     ]
   }
 }
 ```
 
-Now Claude gets nudged once per session to document what it learned — error fixes, config gotchas, API patterns, workflow conventions — so the next session doesn't repeat the work.
-
 ## What This Is NOT
 
 - **Not a memory system** — it stores project knowledge, not conversation history or personal preferences.
-- **Not semantic search** — it's filename fuzzy matching + ripgrep, not vector embeddings.
-- **Not complex** — the entire server is a single TypeScript file with zero heavy dependencies.
+- **Not complex** — the server is a single Python file. Embeddings use ChromaDB's built-in ONNX model (no PyTorch).
 
 ## Tech Stack
 
-- TypeScript + MCP SDK (`@modelcontextprotocol/sdk`)
-- `@vscode/ripgrep` for content search (bundled, no system install)
-- Node.js `fs` for everything else
-- No database, no embeddings, no ML
+- Python 3.10+ with [FastMCP](https://github.com/modelcontextprotocol/python-sdk)
+- [ChromaDB](https://www.trychroma.com/) for vector embeddings (all-MiniLM-L6-v2 via ONNX, no PyTorch)
+- [watchdog](https://github.com/gorakhargosh/watchdog) for filesystem monitoring — docs written via any tool are auto-indexed
+- [uv](https://docs.astral.sh/uv/) for dependency management
 
 ## License
 
