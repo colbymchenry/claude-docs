@@ -11,7 +11,9 @@ Usage:
 
 import argparse
 import os
+import re
 import sys
+from datetime import datetime
 
 import chromadb
 
@@ -90,12 +92,79 @@ def query(prompt: str, project_dir: str, n_results: int = MAX_RESULTS) -> list[d
     return relevant
 
 
+def list_docs(project_dir: str) -> str:
+    """Return doc tree listing + inlined workflow docs, matching server's list_docs()."""
+    root = find_project_root(project_dir)
+    docs_dir = os.path.join(root, ".claude", "docs")
+
+    if not os.path.isdir(docs_dir):
+        return ""
+
+    # Build tree listing
+    def get_all_doc_paths(directory: str) -> list[str]:
+        results: list[str] = []
+        try:
+            for entry in os.scandir(directory):
+                if entry.name.startswith("."):
+                    continue
+                if entry.is_dir():
+                    results.extend(get_all_doc_paths(entry.path))
+                elif entry.name.endswith(".md"):
+                    results.append(entry.path)
+        except OSError:
+            pass
+        return results
+
+    def format_entry(path: str) -> str:
+        topic = os.path.relpath(path, docs_dir).removesuffix(".md")
+        st = os.stat(path)
+        size = st.st_size
+        modified = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d")
+        size_str = f"{size} B" if size < 1024 else f"{size / 1024:.1f} KB"
+        return f"  {topic} ({size_str}, updated {modified})"
+
+    all_docs = get_all_doc_paths(docs_dir)
+    if not all_docs:
+        return ""
+
+    lines = [".claude/docs/"]
+    for doc_path in sorted(all_docs):
+        lines.append(format_entry(doc_path))
+
+    # Inline workflow docs
+    workflow_dir = os.path.join(docs_dir, "workflow")
+    workflow_docs: list[str] = []
+    try:
+        for file_path in get_all_doc_paths(workflow_dir):
+            with open(file_path) as f:
+                content = f.read()
+            topic = os.path.relpath(file_path, docs_dir).removesuffix(".md")
+            workflow_docs.append(f"### {topic}\n{content}")
+    except OSError:
+        pass
+
+    if workflow_docs:
+        lines.append("")
+        lines.append("## Workflow conventions (always apply):")
+        lines.append("")
+        lines.append("\n\n".join(workflow_docs))
+
+    return "\n".join(lines)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--prompt", default="", help="The prompt to search against")
     parser.add_argument("--project-dir", default=os.getcwd(), help="Project directory")
     parser.add_argument("--limit", type=int, default=MAX_RESULTS, help="Max results")
+    parser.add_argument("--list", action="store_true", help="Output doc tree listing")
     args = parser.parse_args()
+
+    if args.list:
+        listing = list_docs(args.project_dir)
+        if listing:
+            print(listing)
+        sys.exit(0)
 
     prompt = args.prompt or sys.stdin.read().strip()
     if not prompt:
@@ -103,11 +172,39 @@ if __name__ == "__main__":
 
     results = query(prompt, project_dir=args.project_dir, n_results=args.limit)
     if results:
-        lines = []
+        # Deduplicate to unique topics, keeping the best similarity per topic
+        topic_best: dict[str, float] = {}
         for r in results:
-            # Truncate text to first 150 chars for concise context injection
-            text = r["text"].replace("\n", " ").strip()
-            if len(text) > 150:
-                text = text[:150] + "..."
-            lines.append(f"- [{r['location']}] {text}")
-        print("\n".join(lines))
+            topic = r["topic"]
+            if topic not in topic_best or r["similarity"] > topic_best[topic]:
+                topic_best[topic] = r["similarity"]
+
+        # Only include topics whose best score is within 0.10 of the top match,
+        # so weak secondary matches don't bloat the context
+        top_score = max(topic_best.values())
+        relevant_topics = [t for t, s in topic_best.items() if s >= top_score - 0.10]
+
+        root = find_project_root(args.project_dir)
+        docs_dir = os.path.join(root, ".claude", "docs")
+        seen_topics: set[str] = set()
+
+        for r in results:
+            topic = r["topic"]
+            if topic in seen_topics or topic not in relevant_topics:
+                continue
+            seen_topics.add(topic)
+
+            doc_path = os.path.join(docs_dir, f"{topic}.md")
+            try:
+                with open(doc_path) as f:
+                    content = f.read()
+            except OSError:
+                continue
+
+            print(f"## Existing doc: {topic}")
+            print(f"(source: .claude/docs/{topic}.md)")
+            print()
+            print(content)
+            print()
+            print("---")
+            print()

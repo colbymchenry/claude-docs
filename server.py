@@ -67,21 +67,29 @@ collection = _init_chromadb(EMBEDDINGS_DIR)
 
 
 def _auto_index_if_needed() -> None:
-    """Index existing docs if the collection is empty but docs exist on disk.
+    """Index any docs on disk that are missing from ChromaDB.
 
-    Note: The DocWatcher also indexes untracked docs on startup, but this
-    handles the case where the server runs without the watcher (e.g. --index).
+    Handles docs created/modified while the MCP server wasn't running.
+    The DocWatcher also does this on startup, but this covers --index mode.
     """
-    if collection.count() > 0:
-        return
     docs = get_all_doc_paths()
     if not docs:
         return
+
+    # Get all indexed topics to find gaps
+    indexed_topics: set[str] = set()
+    try:
+        all_indexed = collection.get()
+        indexed_topics = {m["topic"] for m in all_indexed["metadatas"]}
+    except Exception:
+        pass
+
     for doc_path in docs:
         topic = topic_from_path(doc_path)
-        with open(doc_path) as f:
-            content = f.read()
-        index_document(topic, content)
+        if topic not in indexed_topics:
+            with open(doc_path) as f:
+                content = f.read()
+            index_document(topic, content)
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +330,18 @@ def chunk_document(topic: str, content: str) -> list[dict]:
             continue
 
         if content_text:
-            slug = re.sub(r"[^a-z0-9]+", "-", header.lower()).strip("-")
+            # Include parent h2 in slug for h3s, and deduplicate
+            if header_line.startswith("### ") and current_h2:
+                slug_base = re.sub(r"[^a-z0-9]+", "-", f"{current_h2}-{header}".lower()).strip("-")
+            else:
+                slug_base = re.sub(r"[^a-z0-9]+", "-", header.lower()).strip("-")
+            # Ensure uniqueness by appending a counter if needed
+            slug = slug_base
+            existing_ids = {c["id"] for c in chunks}
+            counter = 2
+            while f"{topic}:{slug}" in existing_ids:
+                slug = f"{slug_base}-{counter}"
+                counter += 1
             chunks.append(
                 {
                     "id": f"{topic}:{slug}",
@@ -645,7 +664,7 @@ def save_doc(topic: str, content: str) -> str:
     with open(doc_path, "w") as f:
         f.write(final_content)
 
-    # Indexing handled by DocWatcher — no manual index_document() call needed
+    # Indexing handled by DocWatcher on filesystem change
 
     parts: list[str] = []
     if previous_content:

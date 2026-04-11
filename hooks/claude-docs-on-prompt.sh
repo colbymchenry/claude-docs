@@ -23,11 +23,25 @@ if [ -z "$PROJECT_DIR" ]; then
     exit 0
 fi
 
+# Get doc tree listing (always include if docs exist)
+LISTING=$(cd "$REPO_DIR" && uv run python query.py --list --project-dir "$PROJECT_DIR" 2>/dev/null)
+
 # Query doc embeddings scoped to the current project
 DOCS=$(cd "$REPO_DIR" && echo "$PROMPT" | uv run python query.py --project-dir "$PROJECT_DIR" 2>/dev/null)
 
+CTX=""
 if [ -n "$DOCS" ]; then
-    jq -n --arg ctx "Relevant project docs (from .claude/docs/ semantic search — use lookup_doc(topic) for full content):\n$DOCS" \
+    # Full doc content injected — Claude gets the docs directly
+    CTX="Relevant project documentation for this task. These docs already exist in .claude/docs/. Do NOT create new docs that overlap with these — if you need to update one, use save_doc with the EXACT same topic name shown below:\n\n$DOCS"
+    if [ -n "$LISTING" ]; then
+        CTX="$CTX\nFull doc index (.claude/docs/):\n$LISTING"
+    fi
+elif [ -n "$LISTING" ]; then
+    CTX="Project documentation (.claude/docs/):\n$LISTING"
+fi
+
+if [ -n "$CTX" ]; then
+    jq -n --arg ctx "$CTX" \
         '{"hookSpecificOutput": {"additionalContext": $ctx}}'
 fi
 
