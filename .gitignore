@@ -14,3 +14,5 @@ dist/
 *.sqlite3
 
 *.lock
+
+*.pickle
