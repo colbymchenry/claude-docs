@@ -1,5 +1,5 @@
 ---
-updated: 2026-04-09
+updated: 2026-04-14
 ---
 
 # School Color System
@@ -56,6 +56,7 @@ The main CSS variable that drives school-colored UI. Set via inline `style` attr
 | File | Line | Variable | Notes |
 |------|------|----------|-------|
 | `sections/cart.liquid` | 29 | `--line-accent` | Cart line item accent |
+| `sections/marquee.liquid` | 12–14 | Inline `background-color` | Conditional via `use_school_color` checkbox; sets bg to accent color, text to `#FFFFFF` |
 | `snippets/slidecart-school-badges.liquid` | 14 | `color` in JSON via snippet | Badge text color, uses `school-accent-color` snippet |
 | `sections/collection.liquid` | 46 | `--school-secondary` | Also sets secondary alongside primary |
 | `sections/schools.liquid` | 136 | Inline `background-color` | School dot indicator |
@@ -111,6 +112,7 @@ For JS/JSON contexts, use `{% capture %}` inside the loop before building the JS
 | File | Status |
 |------|--------|
 | `snippets/slidecart-school-badges.liquid` | Migrated |
+| `sections/marquee.liquid` | Migrated (uses accent snippet with `use_school_color` toggle) |
 | `sections/cart.liquid` | Pending |
 | `sections/product.liquid` | Pending |
 | `sections/product-features.liquid` | Pending |

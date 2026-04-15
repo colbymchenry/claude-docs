@@ -10,6 +10,8 @@ import hashlib
 import logging
 import os
 import re
+import shutil
+import subprocess
 import sys
 import threading
 from dataclasses import dataclass, field
@@ -54,8 +56,43 @@ PROJECT_ROOT, DOCS_DIR, EMBEDDINGS_DIR = _init_paths()
 # ---------------------------------------------------------------------------
 
 
+def _probe_chromadb(embeddings_dir: str) -> bool:
+    # A corrupt on-disk HNSW index (e.g. from a prior process killed mid-write)
+    # segfaults ChromaDB's C extension on load, which can't be caught via
+    # try/except. Run the probe in a child process so a crash is survivable.
+    sqlite_path = os.path.join(embeddings_dir, "chroma.sqlite3")
+    if not os.path.exists(sqlite_path):
+        return True
+
+    probe = (
+        "import chromadb;"
+        f"c=chromadb.PersistentClient(path={embeddings_dir!r});"
+        "col=c.get_or_create_collection("
+        "name='doc-chunks',metadata={'hnsw:space':'cosine'});"
+        "col.count()"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            timeout=30,
+        )
+        return result.returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
+
+
 def _init_chromadb(embeddings_dir: str) -> chromadb.Collection:
     os.makedirs(embeddings_dir, exist_ok=True)
+    if not _probe_chromadb(embeddings_dir):
+        print(
+            f"[claude-docs] ChromaDB index at {embeddings_dir} is corrupt; "
+            "wiping and rebuilding from source docs.",
+            file=sys.stderr,
+            flush=True,
+        )
+        shutil.rmtree(embeddings_dir, ignore_errors=True)
+        os.makedirs(embeddings_dir, exist_ok=True)
     client = chromadb.PersistentClient(path=embeddings_dir)
     return client.get_or_create_collection(
         name="doc-chunks",

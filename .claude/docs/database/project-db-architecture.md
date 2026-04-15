@@ -1,5 +1,5 @@
 ---
-updated: 2026-04-10
+updated: 2026-04-13
 ---
 
 # Project Database Architecture
@@ -20,7 +20,7 @@ All methods are **async** (`Promise<T>`) to support both synchronous (SQLite) an
 - `src/lib/stores/project-store.ts` — interface definition
 - `src/lib/stores/sqlite-store.ts` — SQLite implementation (default)
 - `src/lib/stores/postgresql-store.ts` — PostgreSQL implementation
-- `src/lib/stores/index.ts` — factory + cache + adapter.json reader
+- `src/lib/stores/index.ts` — factory + cache + adapter.json reader + lazy proxy for non-SQLite adapters
 
 ### Factory: `getProjectStore(projectPath)`
 
@@ -43,11 +43,20 @@ Returns a cached `ProjectStore` for the given path. On first call:
 }
 ```
 
+### Adding a new ProjectStore method
+
+When you add a method to the interface, you must update **all** of these in lockstep or the build breaks:
+
+1. `src/lib/stores/project-store.ts` — interface signature
+2. `src/lib/stores/sqlite-store.ts` — SQLite implementation
+3. `src/lib/stores/postgresql-store.ts` — PostgreSQL implementation (call `await this.ensureSchema()` first)
+4. `src/lib/stores/index.ts` — add to the lazy proxy in `createLazyProxy()` (otherwise PG adapters hit a missing-method error)
+
 ### Consumer Files (update ALL when interface changes)
 1. `src/routes/api/projects/+server.ts` — `getProjectCounts()`
 2. `src/routes/api/projects/[id]/+server.ts` — `getProjectCounts()`
 3. `src/routes/api/projects/[id]/issues/[issueId]/+server.ts` — CRUD operations
-4. `src/routes/api/projects/[id]/stream/+server.ts` — SSE polling loop (heaviest consumer)
+4. `src/routes/api/projects/[id]/stream/+server.ts` — SSE subscription loop (heaviest consumer)
 5. `src/lib/task-runner-manager.ts` — task execution, epic sequencing, status polling
 6. `src/lib/check-done-manager.ts` — issue detail lookup
 7. `src/routes/api/projects/[id]/task-runner/+server.ts` — calls `startTaskRun()` (async)
@@ -70,15 +79,32 @@ Returns a cached `ProjectStore` for the given path. On first call:
 
 ### Key Query Patterns
 - `getIssueWithDetails()` — fetches issue + blockers + blocked_by + children (sorted) + parent + comments + blocking relations
-- `getChildIssuesSorted(epicId)` — topological sort via Kahn's algorithm (in-memory JS, both backends)
+- `getChildIssuesSorted(epicId)` — topological sort via Kahn's algorithm (in-memory JS, both backends). Priority breaks ties (lower number = higher priority). Returns disconnected/cycle tasks appended by priority.
+- `getChildBlockingRelations(epicId)` — returns `{source, target}[]` for a single epic's children (edges where `source` blocks `target`)
+- `getAllBlockingRelations()` — returns all `type='blocks'` edges project-wide with both ends not `deleted_at`. Shipped in the SSE stream payload so clients can do per-epic toposort without per-epic fetches.
 - All queries filter `deleted_at IS NULL`
 - Deletes through UI use `deleteIssueViaCli()` for proper JSONL tombstones
 
-### Change Detection & SSE Polling
+### Change Detection & SSE Broadcasting
 - `getDataVersion()` — returns a version number for change detection
 - `notifyChange()` — increments manual counter (sync, not async)
 - `refresh()` — no-op for both backends (SQLite single-conn sees own writes; PG pool sees latest commits)
-- `/api/projects/[id]/stream` polls every 1 second via async `setInterval`
+- `subscribe(collection, callback)` — push-based change notification. SQLite polls internally; PostgreSQL uses `LISTEN/NOTIFY`. Consumer refetches on each event.
+- `/api/projects/[id]/stream` uses `store.subscribe('issues' | 'events' | 'dependencies' | 'comments', ...)` — no setInterval. Refresh calls are coalesced via a `processing` / `pending` flag so concurrent change bursts collapse into a single broadcast.
+
+### SSE stream payload (`/api/projects/[id]/stream`)
+
+The stream sends `init` once, then `update` on every coalesced change. Both payloads include:
+
+- `project` (init only): `{ id, name, path }`
+- `issues: Issue[]` — all non-deleted issues
+- `events: Event[]` — recent audit events (50 for init, new-since-last for update)
+- `blockingRelations: BlockingRelation[]` — all `type='blocks'` edges project-wide. Used by `EpicsView` to topologically sort each epic's children on the client so ordering matches the Task Runner's execution order.
+- `dataVersion: number`
+
+Client consumer is `src/lib/project-stream.svelte.ts` (`createProjectStream`), which exposes each field as a reactive `$state` getter.
+
+Type: `StreamMessage` in `src/lib/types.ts`.
 
 ## Project Initialization Flow (Add Project)
 

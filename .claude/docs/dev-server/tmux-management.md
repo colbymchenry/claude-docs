@@ -1,5 +1,11 @@
 ---
-updated: 2026-04-08
+updated: 2026-04-13
+---
+
+# dev-server/tmux-management
+
+---
+updated: 2026-04-13
 ---
 
 # Dev Server Management (tmux-based)
@@ -88,7 +94,19 @@ The preview URL always uses `http://localhost:<port>` for all frameworks includi
 
 ## Polling Intervals
 
-- **Project page status check**: every 2 seconds (`+page.svelte`)
+- **Project page status check** (header Start/Stop button): `src/routes/(protected)/projects/[id]/+page.svelte` → `createDevServerState().checkStatus()` in `src/lib/dev-server-state.svelte.ts`. Each tick fires up to **two** GETs:
+  1. `GET /api/projects/:id/dev-config` — always
+  2. `GET /api/projects/:id/dev-server/status` — only if `dev-config` returned `hasConfig: true`
+
+  Cadence:
+  - Initial check on mount
+  - **2-second poll interval, gated on `document.visibilityState === 'visible'`** — pauses entirely when the tab is hidden, so background tabs cost zero requests
+  - Immediate re-check when the tab regains visibility (`visibilitychange` listener)
+  - Immediate re-check when `LiveEditMode` closes (`handleLiveEditClose`)
+
+  Why 2s and not longer: this poll is how the header badge detects external changes (server crashes, servers started from a terminal, `dev-config` appearing after an external detection run). 15s crash-detection was tried and rejected — too slow for a button the user might click. 2s is kept.
+
+  The proper fix for eliminating this polling entirely is to push `exit`/`ready`/config-change events from `dev-server-manager.ts` down the existing `/api/projects/:id/stream` SSE channel consumed by `src/lib/project-stream.svelte.ts`, and drive the header badge from those events. Do that before lengthening the interval or adding more fallback logic.
 - **Ready timeout in LiveEditMode**: 2 seconds — if server reports running but not ready after this, it restarts
 - **Session liveness monitor**: every 3 seconds
 

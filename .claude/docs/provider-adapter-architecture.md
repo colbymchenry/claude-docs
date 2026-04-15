@@ -1,5 +1,11 @@
 ---
-updated: 2026-04-10
+updated: 2026-04-13
+---
+
+# provider-adapter-architecture
+
+---
+updated: 2026-04-13
 ---
 
 # Multi-Provider Adapter Architecture
@@ -7,6 +13,10 @@ updated: 2026-04-10
 ## Overview
 
 Kommandr supports multiple AI coding CLI providers (Claude Code, OpenAI Codex, etc.) through a pluggable adapter pattern in `src/lib/providers/`. All consumers (chat-manager, task-runner, scaffold-manager, check-done-manager) route through the registry instead of importing `claude-cli.ts` directly.
+
+## Status
+
+Phases 1-5 implemented and tested. Codex full chat sessions work end-to-end (confirmed 2026-04-11). Task runner with Codex is the remaining manual test item.
 
 ## Key Files
 
@@ -16,8 +26,9 @@ Kommandr supports multiple AI coding CLI providers (Claude Code, OpenAI Codex, e
 | `src/lib/providers/registry.ts` | `registerAdapter()`, `getAdapter(kind)`, `getDefaultProvider()`, `closeAllProviderSessions()` |
 | `src/lib/providers/detection.ts` | `detectBinary(name, customPath?, managedPath?)` — finds CLIs on system |
 | `src/lib/providers/claude/adapter.ts` | `ClaudeAdapter` — wraps `claude-cli.ts`, `claude-code-manager.ts`, `claude-auth.ts` |
-| `src/lib/providers/codex/adapter.ts` | `CodexAdapter` — full implementation: spawn CLI, parse NDJSON, manage sessions |
+| `src/lib/providers/codex/adapter.ts` | `CodexAdapter` — long-lived `codex app-server` process, JSON-RPC 2.0 over stdio |
 | `src/lib/providers/index.ts` | `initProviders()` — registers all adapters, re-exports types |
+| `src/lib/notification-stream.ts` | Shared singleton notification SSE (prevents duplicate connections) |
 
 ## Detection Priority
 
@@ -28,93 +39,133 @@ Kommandr supports multiple AI coding CLI providers (Claude Code, OpenAI Codex, e
 
 The result includes `source: 'custom' | 'system' | 'managed'` so the UI can show where the binary was found.
 
-## How Consumers Use It
+## Codex Adapter — `codex app-server` JSON-RPC
 
-```typescript
-import { initProviders, getAdapter, getDefaultProvider } from './providers';
-import type { ProviderSession, ProviderOutputChunk } from './providers';
+The `CodexAdapter` in `src/lib/providers/codex/adapter.ts` uses a **long-lived `codex app-server` process** that speaks JSON-RPC 2.0 over stdio (newline-delimited JSON on stdin/stdout).
 
-initProviders(); // Safe to call multiple times
+### Protocol Lifecycle
 
-const adapter = getAdapter(getDefaultProvider()); // or getAdapter('claude')
-const session = adapter.createSession({ projectPath, model: 'opus', ... });
-adapter.sendMessage(session, message, onData, onError, onClose);
-adapter.cancelResponse(session);
-adapter.closeSession(session);
+```
+1. spawn `codex app-server` (cwd = project path)
+2. → initialize { clientInfo, capabilities: { experimentalApi: true } }
+   ← { result: { userAgent, codexHome, ... } }
+3. → initialized (notification, no id)
+4. → thread/start { model, approvalPolicy, sandbox, cwd, instructions? }
+   ← { result: { thread: { id } }, model, ... }
+   ← thread/started (notification)
+   ← mcpServer/startupStatus/updated (notification — codex_apps starting/ready)
+5. → turn/start { threadId, input: [{ type: "text", text, text_elements: [] }], model, effort }
+   ← turn/started (notification)
+   ← item/started { item: { type: "reasoning" } }
+   ← item/completed (reasoning done)
+   ← item/started { item: { type: "agentMessage", phase: "final_answer" } }
+   ← item/agentMessage/delta (notification, repeated — streaming text)
+   ← item/completed (message done)
+   ← thread/tokenUsage/updated (notification — cumulative token counts)
+   ← turn/completed { turn: { id, status, durationMs } }
+6. Subsequent messages: repeat step 5 on same threadId
 ```
 
-## Chat UI Provider Selection (Phase 4)
+### Agent/Planner Instructions for Codex
 
-Users can pick which provider to use when starting a chat session:
+The Codex CLI has no `--system-prompt` flag like Claude. To pass behavioral instructions (e.g. the planner system prompt):
 
-- **ChatSheet.svelte** — owns `selectedProvider` state (`ProviderKind`), fetches available providers from `GET /api/providers/status?all=true` on mount, passes list down to ChatInput
-- **ChatInput.svelte** — shows a provider dropdown (only when 2+ providers are available) alongside the mode and model dropdowns. Changing provider resets the model to the first available for that provider. Props: `provider` (bindable), `providerLocked`, `availableProviders: ProviderStatus[]`
-- **chat-session.svelte.ts** — `ChatSessionDeps.getProvider()` returns the selected `ProviderKind`. `startSession()` sends `provider` in the POST body to `/api/projects/{id}/chat`
-- **ChatModel type** — widened from `'opus' | 'sonnet' | ...` to `string` to support any provider's model slugs
-- **Agent frontmatter** — `provider: codex` in an agent's YAML frontmatter auto-selects and locks that provider in the UI. The `providerLocked` flag prevents the user from switching.
+1. **`thread/start.instructions`** — passed as a param; may or may not be honored depending on Codex version
+2. **First message prepend** (guaranteed path) — on `session.isFirstMessage`, the adapter prepends `session.agentPrompt` wrapped in `<system-instructions>` tags to the user's message text in `turn/start`
 
-Model list is dynamic: `ChatInput` derives models from `availableProviders.find(p => p.provider === selectedProvider).models`.
+This is critical for Planner mode: without these instructions, Codex has no awareness it should only plan (create tasks/epics) and will try to implement code directly.
 
-## Codex Adapter (Phase 5)
+**Ordering note:** `session.isFirstMessage` must be checked BEFORE setting it to `false` in `sendMessage()`.
 
-The `CodexAdapter` in `src/lib/providers/codex/adapter.ts` is a full implementation:
+### Critical: `experimentalApi: true`
 
-### CLI Invocation
-Each `sendMessage()` spawns a new process:
-```
-codex --quiet --output-format json --model <model> --approval-mode <mode> <message>
-```
+The `initialize` request MUST include `capabilities: { experimentalApi: true }`. Discovered by comparing with the t3code reference implementation.
 
-Key flags:
-- `--quiet` — non-interactive scripting mode
-- `--output-format json` — NDJSON output for structured parsing
-- `--approval-mode full-auto` (agent mode) or `suggest` (plan/ask mode)
-- `--conversation-id <id>` — for multi-turn continuation (captured from first response)
-- `--instructions <prompt>` — agent system prompt (first message only)
+### Token Usage
 
-### Output Parsing
-Inline `parseCodexLine()` function normalizes Codex NDJSON events to `ProviderOutputChunk`:
+Token counts do NOT arrive in `turn/completed`. They come in a separate `thread/tokenUsage/updated` notification that fires BEFORE `turn/completed`. The adapter stores the latest usage in `ctx.lastUsage` and includes it in the `done` chunk.
 
-| Codex Event | ProviderOutputChunk Type |
-|---|---|
-| `{ type: "message", content }` | `text` |
-| `{ type: "function_call", name, arguments }` | `tool_use` |
-| `{ type: "function_call_output", output }` | `tool_result` |
-| `{ type: "error", message }` | `error` |
-| `{ type: "status", status }` | `status` |
-| `{ type: "thinking", content }` | `thinking` |
-| `{ type: "usage"/"done", input_tokens, ... }` | `done` (with usage stats) |
+### Session Context & State Persistence
 
-### Auth Detection
-`detect()` checks auth via:
-1. Running `codex auth status` (5s timeout)
-2. Falling back to checking `OPENAI_API_KEY` env var
+The adapter maintains three lookup maps stored on `globalThis` (survives module re-evaluation — see `hmr-and-module-reload-state-persistence` doc):
+- `sessions: Map<string, ProviderSession>` — keyed by adapter's internal UUID
+- `contexts: Map<string, CodexSessionContext>` — holds child process, readline, pending requests
+- `contextsByProcess: WeakMap<ChildProcess, CodexSessionContext>` — fallback lookup
 
-### Session Management
-- Sessions stored in a module-level `Map<string, ProviderSession>`
-- `cancelResponse()` sends SIGINT with SIGKILL fallback after 3s
-- `closeAllSessions()` terminates all active processes
+**Important:** `sendMessage()` waits for `ctx.initPromise` to resolve before sending `turn/start`. This handles the ~1 second window between session creation and thread initialization.
 
-## Model Styles
+### Server Requests (auto-approved)
 
-`src/lib/agents-client.ts` `modelStyles` contains badge colors for all providers:
+| Method | Response |
+|--------|----------|
+| `item/commandExecution/requestApproval` | `{ decision: "allow" }` |
+| `item/fileChange/requestApproval` | `{ decision: "allow" }` |
+| `item/tool/requestUserInput` | `{ answers: {} }` |
 
-| Provider | Model Slugs | Color Theme |
-|---|---|---|
-| Claude | `opus`, `opus[1m]`, `sonnet`, `sonnet[1m]`, `haiku` | Amber/blue/green |
-| Codex | `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.3-codex`, `gpt-5.2` | Indigo/violet |
+### `item/started` — Thread Item Types
 
-`getModelStyle(slug)` returns label + bg + color; falls back to `sonnet` style for unknown slugs.
+Canonical spec is at `codex-rs/app-server-protocol/src/protocol/v2.rs` in the `openai/codex` repo (`ThreadItem` enum, `#[serde(tag = "type", rename_all = "camelCase")]`). The full set of `item.type` values:
+
+| Type | Key fields | Notes |
+|------|-----------|-------|
+| `userMessage` | `content: UserInput[]` | User's turn input |
+| `hookPrompt` | `fragments` | Hook-injected prompt fragments |
+| `agentMessage` | `text, phase, memoryCitation` | Assistant reply (streams via `item/agentMessage/delta`) |
+| `plan` | `text` | Experimental plan item |
+| `reasoning` | `summary[], content[]` | Streams via `item/reasoning/textDelta` and `.../summaryTextDelta` |
+| `commandExecution` | `command, cwd, commandActions[], status, aggregatedOutput, exitCode, durationMs` | **See below** |
+| `fileChange` | `changes: [{path, kind: "add"\|"delete"\|"update"}], status` | Patch result |
+| `mcpToolCall` | `server, tool, arguments, result, error, status` | MCP tool invocation |
+| `dynamicToolCall` | `tool, arguments, contentItems, success, status` | Non-MCP tool call |
+| `collabAgentToolCall` | `tool, senderThreadId, receiverThreadIds, prompt, ...` | Sub-agent spawn/dispatch |
+| `webSearch` | `query, action` | Web search invocation |
+| `imageView` | `path` | Image shown to model |
+| `imageGeneration` | `status, result, revisedPrompt, savedPath` | Generated image |
+| `enteredReviewMode` / `exitedReviewMode` | `review` | `/review` flow |
+| `contextCompaction` | — | Auto-compact |
+
+### `commandExecution.commandActions` — semantic tool parsing
+
+Codex wraps every shell invocation in `/bin/zsh -lc "cd <cwd> && …"`, so the raw `command` string looks generic. Codex pre-parses the command into semantic actions on the `commandActions` field — use this, not the shell string, to label tool cards in the UI.
+
+`commandActions` is `Vec<CommandAction>` where each action is (tagged union, `"type"` key, camelCase):
+
+| `type` | Fields | Maps to |
+|--------|--------|---------|
+| `read` | `command, name, path` | `Read` |
+| `listFiles` | `command, path?` | `LS` |
+| `search` | `command, query?, path?` | `Grep` |
+| `unknown` | `command` | `Bash` (fall back to raw command) |
+
+A single shell command can emit multiple actions when piped (`cat a.txt \| grep foo` → `[Read, Search]`) — the first action is the usual label.
+
+### Current adapter coverage vs. protocol (as of 2026-04-13)
+
+`handleNotification()` in `src/lib/providers/codex/adapter.ts` only handles `commandExecution` and `fileChange`, both hardcoded to `toolName: 'Bash'` / `'Edit'`, and ignores `commandActions`. As a result:
+
+- All Codex actions render as **"Terminal"** with the raw `/bin/zsh -lc "cd …"` wrapper in `ToolCallStack.svelte`, even when Codex already classified the command as Read/Search/LS.
+- `mcpToolCall`, `dynamicToolCall`, `webSearch`, `imageView`, `imageGeneration`, `plan`, `collabAgentToolCall` are silently dropped from the UI.
+- `item/updated` is not handled, so tool cards never transition from in-progress to completed/failed.
+
+To fix: inspect `item.commandActions[0].type` and map to `Read` / `LS` / `Grep` / `Bash`; use `fileChange.changes[0].kind` for `Write` (add) vs `Edit` (update); add explicit cases for `mcpToolCall` (`toolName: item.tool`), `dynamicToolCall`, `webSearch` (`toolName: 'WebSearch'`), and handle `item/updated` for status transitions.
+
+## SSE Connection Management (CRITICAL)
+
+See the dedicated `sse-connection-management` doc for full details. Key points:
+
+- **NEVER use `EventSource`** — all SSE must use fetch-based streams with AbortController
+- **NEVER duplicate SSE connections** — use singletons (e.g., `notification-stream.ts`)
+- **Keep total concurrent streams ≤ 5** — Chromium's 6-per-origin HTTP/1.1 limit leaves only 1 slot for API calls
+- The Codex integration was blocked for days by this: 7+ SSE connections meant message POSTs were queued forever by Chromium
 
 ## Adding a New Provider
 
 1. Create `src/lib/providers/<name>/adapter.ts` implementing `ProviderAdapter`
-2. Add the kind to `ProviderKind` union in `types.ts` (e.g., `'claude' | 'codex' | 'gemini'`)
+2. Add the kind to `ProviderKind` union in `types.ts`
 3. Register in `src/lib/providers/index.ts`
 4. Add `<name>?: ProviderSettings` to `AppSettings.providers` in `settings.ts`
 5. Add model badge styles to `modelStyles` in `agents-client.ts`
 6. The adapter must implement: `detect()`, `createSession()`, `sendMessage()`, `cancelResponse()`, `closeSession()`, `closeAllSessions()`
-7. Optional: `auth` (login/logout/status) and `installer` (managed install/update)
 
 ## Settings
 
@@ -129,19 +180,6 @@ Provider config in `~/.kommandr/settings.json`:
 }
 ```
 
-## API Endpoints
-
-- `GET /api/providers/status?all=true` — Runs `detect()` on all adapters, returns `ProviderStatus[]`
-- `GET/PUT /api/settings/providers` — Read/write provider settings and default provider
-- `POST /api/projects/[id]/chat` — Accepts `provider` in body to select which provider to use
-
-## Backward Compatibility
-
-- `claude-cli.ts` is unchanged — the Claude adapter wraps it
-- `chat-manager.ts` exports `getOrCreateClaudeProcess` as an alias for `getOrCreateProcess`
-- `closeClaudeSession` is an alias for `closeProviderSession`
-- The `/api/claude-code/*` endpoints remain for Claude-specific install/update/login flows
-
 ## Roadmap
 
-Tracked in `MULTI-PROVIDER-ROADMAP.md` at repo root. Phases 1-5 are implemented. Remaining: manual testing for Phase 4/5, and Future Providers section documents the pattern for adding more.
+Tracked in `MULTI-PROVIDER-ROADMAP.md` at repo root. Phases 1-5 implemented. Codex chat confirmed working. Remaining: task runner with Codex provider.
